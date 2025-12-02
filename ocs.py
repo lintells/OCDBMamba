@@ -4,98 +4,104 @@ import torch.nn.functional as F
 
 
 class OCS(nn.Module):
-    def __init__(
-        self,
-        channels,
-        reduction=4,
-        use_bidir=True,
-        use_channel=True,
-        use_cross=True,
-        use_saliency=True,
-        use_pos=True,
-    ):
+    def __init__(self, dim, reduction=4, alpha=1.0, beta=1.0, eta=1.0, ksize=3):
         super().__init__()
-        self.use_bidir = use_bidir
-        self.use_channel = use_channel
-        self.use_cross = use_cross
-        self.use_saliency = use_saliency
-        self.use_pos = use_pos
+        self.dim = dim
+        self.alpha = alpha
+        self.beta = beta
+        self.eta = eta
 
-        mid = max(channels // reduction, 1)
+        mid = max(dim // reduction, 1)
 
-        self.h_conv = nn.Conv2d(channels, channels, kernel_size=(3, 1), padding=(1, 0), bias=False)
-        self.w_conv = nn.Conv2d(channels, channels, kernel_size=(1, 3), padding=(0, 1), bias=False)
+        self.spatial_in = nn.Linear(dim, dim, bias=False)
+        self.spatial_state = nn.Conv1d(dim, dim, kernel_size=ksize, padding=ksize // 2, groups=dim, bias=False)
+        self.spatial_out = nn.Linear(dim, dim, bias=False)
 
-        self.dir_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.ch_in = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
+        self.ch_state = nn.Conv1d(dim, dim, kernel_size=ksize, padding=ksize // 2, groups=dim, bias=False)
+        self.ch_out = nn.Conv1d(dim, dim, kernel_size=1, bias=False)
 
-        self.chan_fc1 = nn.Conv2d(channels, mid, kernel_size=1, bias=True)
-        self.chan_fc2 = nn.Conv2d(mid, channels, kernel_size=1, bias=True)
+        self.ch_mlp = nn.Sequential(
+            nn.Conv1d(dim, mid, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(mid, dim, kernel_size=1),
+        )
 
-        self.cross_gate = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.diff_weight = nn.Parameter(torch.tensor(1.0))
+        self.out_norm = nn.BatchNorm2d(dim)
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
 
-        self.saliency_conv = nn.Conv2d(channels, 1, kernel_size=3, padding=1, bias=True)
+    def _build_indices(self, h, w, device):
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing="ij",
+        )
+        idx_row = (grid_y * w + grid_x).reshape(-1)
+        idx_row_rev = idx_row.flip(0)
 
-        self.pos_conv = nn.Conv2d(2, channels, kernel_size=3, padding=1, bias=False)
+        grid_y_t = grid_x
+        grid_x_t = grid_y
+        idx_col = (grid_y_t * h + grid_x_t).reshape(-1)
+        idx_col_rev = idx_col.flip(0)
 
-        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.norm = nn.BatchNorm2d(channels)
+        return idx_row, idx_row_rev, idx_col, idx_col_rev
+
+    def _scan(self, x, idx):
+        b, c, h, w = x.shape
+        x_seq = x.flatten(2).transpose(1, 2)
+        x_seq = x_seq[:, idx]
+        x_seq = self.spatial_in(x_seq)
+        x_seq = x_seq.transpose(1, 2)
+        x_seq = self.spatial_state(x_seq)
+        x_seq = x_seq.transpose(1, 2)
+        x_seq = self.spatial_out(x_seq)
+        x_seq = x_seq.new_empty(b, h * w, c).scatter_(1, idx.view(1, -1, 1).expand(b, -1, c), x_seq)
+        x_seq = x_seq.transpose(1, 2).reshape(b, c, h, w)
+        return x_seq
+
+    def _spatial_branch(self, x):
+        b, c, h, w = x.shape
+        idx_row, idx_row_rev, idx_col, idx_col_rev = self._build_indices(h, w, x.device)
+        y1 = self._scan(x, idx_row)
+        y2 = self._scan(x, idx_row_rev)
+        y3 = self._scan(x, idx_col)
+        y4 = self._scan(x, idx_col_rev)
+        y = (y1 + y2 + y3 + y4) * 0.25
+        return y
+
+    def _channel_branch(self, x):
+        b, c, h, w = x.shape
+        seq = x.reshape(b, c, h * w)
+        seq = self.ch_in(seq)
+        seq = self.ch_state(seq)
+        seq = self.ch_out(seq)
+        gap = x.mean(dim=(2, 3))
+        gap = F.normalize(gap, dim=1)
+        m = torch.matmul(gap.unsqueeze(2), gap.unsqueeze(1))
+        seq_agg = torch.matmul(m, seq)
+        seq_agg = self.ch_mlp(seq_agg)
+        y = seq_agg.reshape(b, c, h, w)
+        return y
+
+    def _difference_branch(self, x):
+        b, c, h, w = x.shape
+        pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        cx = pad[:, :, 1:-1, 1:-1]
+        n1 = pad[:, :, 1:-1, :-2]
+        n2 = pad[:, :, 1:-1, 2:]
+        n3 = pad[:, :, :-2, 1:-1]
+        n4 = pad[:, :, 2:, 1:-1]
+        diff = (cx - n1).abs() + (cx - n2).abs() + (cx - n3).abs() + (cx - n4).abs()
+        diff = diff * 0.25
+        y = x + self.diff_weight * diff
+        return y
 
     def forward(self, x):
-        b, c, h, w = x.size()
-
-        h_ctx = x.mean(dim=3, keepdim=True)
-        w_ctx = x.mean(dim=2, keepdim=True)
-
-        h_feat = self.h_conv(h_ctx)
-        w_feat = self.w_conv(w_ctx)
-
-        h_feat = F.interpolate(h_feat, size=(h, w), mode="bilinear", align_corners=False)
-        w_feat = F.interpolate(w_feat, size=(h, w), mode="bilinear", align_corners=False)
-
-        if self.use_bidir:
-            dir_feat = h_feat + w_feat
-        else:
-            dir_feat = h_feat
-
-        dir_feat = self.dir_proj(dir_feat)
-
-        if self.use_channel:
-            gap = F.adaptive_avg_pool2d(x, 1)
-            ch = self.chan_fc1(gap)
-            ch = F.relu(ch, inplace=True)
-            ch = self.chan_fc2(ch)
-            ch = torch.sigmoid(ch)
-        else:
-            ch = 1.0
-
-        if self.use_cross:
-            cross = torch.sigmoid(self.cross_gate(h_feat + w_feat))
-        else:
-            cross = 1.0
-
-        if self.use_saliency:
-            sal = torch.sigmoid(self.saliency_conv(x))
-        else:
-            sal = 1.0
-
-        if self.use_pos:
-            yy, xx = torch.meshgrid(
-                torch.linspace(-1.0, 1.0, h, device=x.device),
-                torch.linspace(-1.0, 1.0, w, device=x.device),
-                indexing="ij",
-            )
-            pos = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(b, -1, -1, -1)
-            pos_feat = self.pos_conv(pos)
-        else:
-            pos_feat = 0.0
-
-        gate = dir_feat * ch
-        gate = gate * cross
-        gate = gate * sal
-        gate = torch.tanh(gate)
-
-        out = x + gate + pos_feat
-        out = self.out_proj(out)
-        out = self.norm(out)
-
-        return out
+        y_spatial = self._spatial_branch(x)
+        y_ch = self._channel_branch(x)
+        y_diff = self._difference_branch(x)
+        y = self.alpha * y_spatial + self.beta * y_ch + self.eta * y_diff
+        y = self.out_proj(y)
+        y = self.out_norm(y)
+        return y
